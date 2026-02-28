@@ -3,6 +3,20 @@ import { useState, useEffect, useRef, useCallback } from "react";
 const KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2";
 
 // RSA-PSS signing using Web Crypto API (works in browser)
+function encodeLen(len) {
+  if (len < 128) return [len];
+  if (len < 256) return [0x81, len];
+  return [0x82, (len >> 8) & 0xff, len & 0xff];
+}
+
+function pkcs1ToPkcs8(pkcs1) {
+  const rsaAlg = new Uint8Array([0x30,0x0d,0x06,0x09,0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x01,0x05,0x00]);
+  const ver = new Uint8Array([0x02,0x01,0x00]);
+  const octet = new Uint8Array([0x04, ...encodeLen(pkcs1.length), ...pkcs1]);
+  const inner = new Uint8Array([...ver, ...rsaAlg, ...octet]);
+  return new Uint8Array([0x30, ...encodeLen(inner.length), ...inner]);
+}
+
 async function importPrivateKey(pemKey) {
   const cleaned = pemKey
     .replace(/-----BEGIN RSA PRIVATE KEY-----/, "")
@@ -10,17 +24,17 @@ async function importPrivateKey(pemKey) {
     .replace(/-----BEGIN PRIVATE KEY-----/, "")
     .replace(/-----END PRIVATE KEY-----/, "")
     .replace(/\s+/g, "");
-  const binary = Uint8Array.from(atob(cleaned), c => c.charCodeAt(0));
-  try {
-    return await crypto.subtle.importKey(
-      "pkcs8", binary.buffer,
-      { name: "RSA-PSS", hash: "SHA-256" },
-      false, ["sign"]
-    );
-  } catch {
-    // Try as PKCS#1 via SPKI fallback — some keys need different format
-    throw new Error("Could not import private key. Make sure you copied the full key including the BEGIN/END lines.");
+  const pkcs1 = Uint8Array.from(atob(cleaned), c => c.charCodeAt(0));
+  for (const der of [pkcs1, pkcs1ToPkcs8(pkcs1)]) {
+    try {
+      return await crypto.subtle.importKey(
+        "pkcs8", der.buffer,
+        { name: "RSA-PSS", hash: "SHA-256" },
+        false, ["sign"]
+      );
+    } catch {}
   }
+  throw new Error("Could not import private key. Make sure you copied the full key including the BEGIN/END lines.");
 }
 
 async function makeKalshiHeaders(keyId, privateKey, method, path) {
