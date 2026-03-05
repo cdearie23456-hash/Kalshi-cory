@@ -1,810 +1,469 @@
-import { useState, useEffect, useRef, useCallback } from "import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from “react”;
 
-// ── Public market data (no auth needed, CORS enabled) ──
-const KRAKEN_BASE = "https://api.kraken.com/0/public";
+const KALSHI_BASE = “https://trading-api.kalshi.com/trade-api/v2”;
+const DEMO_BASE = “https://demo-api.kalshi.co/trade-api/v2”;
 
-// ── Technical Indicators ──
-function calcEMA(data, period) {
-  const k = 2 / (period + 1);
-  let ema = data.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  const result = new Array(period - 1).fill(null);
-  result.push(ema);
-  for (let i = period; i < data.length; i++) {
-    ema = data[i] * k + ema * (1 - k);
-    result.push(ema);
-  }
-  return result;
+// ── RSA-PSS Signing (Web Crypto API) ──
+function pemToArrayBuffer(pem) {
+const b64 = pem
+.replace(/—–BEGIN PRIVATE KEY—–/, “”)
+.replace(/—–END PRIVATE KEY—–/, “”)
+.replace(/—–BEGIN RSA PRIVATE KEY—–/, “”)
+.replace(/—–END RSA PRIVATE KEY—–/, “”)
+.replace(/\s+/g, “”);
+const binary = atob(b64);
+const buf = new ArrayBuffer(binary.length);
+const view = new Uint8Array(buf);
+for (let i = 0; i < binary.length; i++) view[i] = binary.charCodeAt(i);
+return buf;
 }
 
-function calcRSI(data, period = 14) {
-  const result = new Array(period).fill(null);
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const diff = data[i] - data[i - 1];
-    if (diff > 0) gains += diff; else losses -= diff;
-  }
-  let avgGain = gains / period, avgLoss = losses / period;
-  result.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
-  for (let i = period + 1; i < data.length; i++) {
-    const diff = data[i] - data[i - 1];
-    avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
-    avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
-    result.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
-  }
-  return result;
+async function importPrivateKey(pem) {
+const keyData = pemToArrayBuffer(pem);
+return await crypto.subtle.importKey(
+“pkcs8”,
+keyData,
+{ name: “RSA-PSS”, hash: “SHA-256” },
+false,
+[“sign”]
+);
 }
 
-function calcMACD(closes) {
-  const ema12 = calcEMA(closes, 12);
-  const ema26 = calcEMA(closes, 26);
-  const macd = ema12.map((v, i) => (v && ema26[i] ? v - ema26[i] : null));
-  const validMacd = macd.filter(Boolean);
-  const signal = calcEMA(validMacd, 9);
-  const fullSignal = new Array(macd.length - signal.length).fill(null).concat(signal);
-  return { macd, signal: fullSignal };
+async function signRequest(privateKeyPem, method, path) {
+const timestamp = Date.now().toString();
+const msgString = timestamp + method + path.split(”?”)[0];
+const encoder = new TextEncoder();
+const key = await importPrivateKey(privateKeyPem);
+const signature = await crypto.subtle.sign(
+{ name: “RSA-PSS”, saltLength: 32 },
+key,
+encoder.encode(msgString)
+);
+const sigBase64 = btoa(String.fromCharCode(…new Uint8Array(signature)));
+return { timestamp, sigBase64 };
 }
 
-function calcBollingerBands(closes, period = 20, stdDev = 2) {
-  const result = { upper: [], middle: [], lower: [] };
-  for (let i = 0; i < closes.length; i++) {
-    if (i < period - 1) { result.upper.push(null); result.middle.push(null); result.lower.push(null); continue; }
-    const slice = closes.slice(i - period + 1, i + 1);
-    const mean = slice.reduce((a, b) => a + b, 0) / period;
-    const variance = slice.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / period;
-    const sd = Math.sqrt(variance);
-    result.upper.push(mean + stdDev * sd);
-    result.middle.push(mean);
-    result.lower.push(mean - stdDev * sd);
-  }
-  return result;
+async function kalshiFetch(path, method = “GET”, keyId, privateKeyPem, body = null, useDemo = false) {
+const base = useDemo ? DEMO_BASE : KALSHI_BASE;
+const { timestamp, sigBase64 } = await signRequest(privateKeyPem, method, `/trade-api/v2${path}`);
+const headers = {
+“Content-Type”: “application/json”,
+“KALSHI-ACCESS-KEY”: keyId,
+“KALSHI-ACCESS-SIGNATURE”: sigBase64,
+“KALSHI-ACCESS-TIMESTAMP”: timestamp,
+};
+const options = { method, headers };
+if (body) options.body = JSON.stringify(body);
+const res = await fetch(base + path, options);
+if (!res.ok) {
+const err = await res.json().catch(() => ({}));
+throw new Error(err.message || `HTTP ${res.status}`);
+}
+return await res.json();
 }
 
-// ── Signal Engine ──
-function generateSignal(closes, volumes) {
-  if (closes.length < 30) return { signal: "WAIT", confidence: 0, reasons: [] };
-  const rsi = calcRSI(closes);
-  const ema9 = calcEMA(closes, 9);
-  const ema21 = calcEMA(closes, 21);
-  const { macd, signal: macdSignal } = calcMACD(closes);
-  const bb = calcBollingerBands(closes);
-  const n = closes.length - 1;
-  const curRSI = rsi[n], prevRSI = rsi[n - 1];
-  const curEMA9 = ema9[n], prevEMA9 = ema9[n - 1];
-  const curEMA21 = ema21[n], prevEMA21 = ema21[n - 1];
-  const curMACD = macd[n], curSignal = macdSignal[n];
-  const prevMACD = macd[n - 1], prevSignalLine = macdSignal[n - 1];
-  const price = closes[n];
-  const bbLower = bb.lower[n], bbUpper = bb.upper[n];
-  const avgVol = volumes.slice(-10).reduce((a, b) => a + b, 0) / 10;
-  const volSpike = volumes[n] > avgVol * 1.3;
+async function kalshiPublicFetch(path) {
+const res = await fetch(KALSHI_BASE + path);
+if (!res.ok) throw new Error(`HTTP ${res.status}`);
+return await res.json();
+}
 
-  let buyScore = 0, sellScore = 0;
-  const reasons = [];
+// ── Claude AI Market Analyzer ──
+async function analyzeMarketWithClaude(market) {
+const prompt = `You are a prediction market analyst. Analyze this Kalshi market and give a YES or NO recommendation.
 
-  // RSI signals
-  if (curRSI < 30) { buyScore += 3; reasons.push({ type: "buy", text: `RSI oversold (${curRSI.toFixed(1)})` }); }
-  else if (curRSI < 40 && prevRSI < curRSI) { buyScore += 2; reasons.push({ type: "buy", text: `RSI rising from low (${curRSI.toFixed(1)})` }); }
-  if (curRSI > 70) { sellScore += 3; reasons.push({ type: "sell", text: `RSI overbought (${curRSI.toFixed(1)})` }); }
-  else if (curRSI > 60 && prevRSI > curRSI) { sellScore += 2; reasons.push({ type: "sell", text: `RSI falling from high (${curRSI.toFixed(1)})` }); }
+Market: ${market.title}
+Current YES price: ${market.yes_ask}¢
+Current NO price: ${market.no_ask}¢
+Volume: ${market.volume || 0}
+Close time: ${market.close_time ? new Date(market.close_time).toLocaleDateString() : “Unknown”}
 
-  // EMA crossover
-  if (prevEMA9 < prevEMA21 && curEMA9 > curEMA21) { buyScore += 3; reasons.push({ type: "buy", text: "EMA9 crossed above EMA21 🚀" }); }
-  if (prevEMA9 > prevEMA21 && curEMA9 < curEMA21) { sellScore += 3; reasons.push({ type: "sell", text: "EMA9 crossed below EMA21 ⬇️" }); }
-  if (curEMA9 > curEMA21) { buyScore += 1; reasons.push({ type: "buy", text: "Uptrend (EMA9 > EMA21)" }); }
-  else { sellScore += 1; reasons.push({ type: "sell", text: "Downtrend (EMA9 < EMA21)" }); }
+Respond ONLY with valid JSON, no markdown:
+{“side”: “YES” or “NO”, “confidence”: number 1-99, “reasoning”: “2 sentence explanation”, “edge”: “brief edge”}`;
 
-  // MACD
-  if (curMACD && curSignal && prevMACD && prevSignalLine) {
-    if (prevMACD < prevSignalLine && curMACD > curSignal) { buyScore += 3; reasons.push({ type: "buy", text: "MACD bullish crossover ✨" }); }
-    if (prevMACD > prevSignalLine && curMACD < curSignal) { sellScore += 3; reasons.push({ type: "sell", text: "MACD bearish crossover ⚠️" }); }
-    if (curMACD > 0 && curMACD > curSignal) { buyScore += 1; reasons.push({ type: "buy", text: "MACD positive momentum" }); }
-  }
-
-  // Bollinger Bands
-  if (bbLower && price < bbLower) { buyScore += 2; reasons.push({ type: "buy", text: "Price below BB lower band" }); }
-  if (bbUpper && price > bbUpper) { sellScore += 2; reasons.push({ type: "sell", text: "Price above BB upper band" }); }
-
-  // Volume
-  if (volSpike && buyScore > sellScore) { buyScore += 1; reasons.push({ type: "buy", text: "High volume confirms move" }); }
-
-  const total = buyScore + sellScore;
-  if (total === 0) return { signal: "WAIT", confidence: 0, reasons };
-
-  if (buyScore > sellScore && buyScore >= 5) {
-    return { signal: "BUY", confidence: Math.min(Math.round((buyScore / (buyScore + sellScore)) * 100), 99), reasons };
-  }
-  if (sellScore > buyScore && sellScore >= 5) {
-    return { signal: "SELL", confidence: Math.min(Math.round((sellScore / (buyScore + sellScore)) * 100), 99), reasons };
-  }
-  return { signal: "WAIT", confidence: 0, reasons };
+const response = await fetch(“https://api.anthropic.com/v1/messages”, {
+method: “POST”,
+headers: { “Content-Type”: “application/json” },
+body: JSON.stringify({
+model: “claude-sonnet-4-20250514”,
+max_tokens: 300,
+messages: [{ role: “user”, content: prompt }],
+}),
+});
+const data = await response.json();
+const text = data.content?.map(b => b.text || “”).join(””) || “”;
+const clean = text.replace(/`json|`/g, “”).trim();
+return JSON.parse(clean);
 }
 
 // ── Main App ──
-export default function CryptoBot() {
-  const [candles, setCandles] = useState([]);
-  const [price, setPrice] = useState(null);
-  const [signal, setSignal] = useState({ signal: "WAIT", confidence: 0, reasons: [] });
-  const [balance, setBalance] = useState(500);
-  const [btcHeld, setBtcHeld] = useState(0);
-  const [trades, setTrades] = useState([]);
-  const [logs, setLogs] = useState([]);
-  const [running, setRunning] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [entryPrice, setEntryPrice] = useState(null);
-  const [totalPnl, setTotalPnl] = useState(0);
-  const [lastUpdate, setLastUpdate] = useState(null);
-  const intervalRef = useRef(null);
-  const tradeRef = useRef({ balance: 500, btcHeld: 0, entryPrice: null });
+export default function KalshiBot() {
+const [screen, setScreen] = useState(“connect”);
+const [keyId, setKeyId] = useState(””);
+const [privateKey, setPrivateKey] = useState(””);
+const [useDemo, setUseDemo] = useState(true);
+const [connecting, setConnecting] = useState(false);
+const [connectError, setConnectError] = useState(null);
+const [balance, setBalance] = useState(null);
 
-  const addLog = useCallback((msg, type = "info") => {
-    const time = new Date().toLocaleTimeString();
-    setLogs(prev => [{ msg, type, time }, ...prev].slice(0, 50));
-  }, []);
+const [markets, setMarkets] = useState([]);
+const [loadingMarkets, setLoadingMarkets] = useState(false);
+const [analyses, setAnalyses] = useState({});
+const [analyzingId, setAnalyzingId] = useState(null);
 
-  const fetchCandles = useCallback(async () => {
-    try {
-      const res = await fetch(`${KRAKEN_BASE}/OHLC?pair=XBTUSD&interval=15`);
-      const data = await res.json();
-      if (data.error && data.error.length > 0) throw new Error(data.error[0]);
-      const raw = data.result.XXBTZUSD || data.result[Object.keys(data.result)[0]];
-      const parsed = raw.slice(-60).map(c => ({
-        time: c[0], open: parseFloat(c[1]), high: parseFloat(c[2]),
-        low: parseFloat(c[3]), close: parseFloat(c[4]), volume: parseFloat(c[6])
-      }));
-      setCandles(parsed);
-      const latest = parsed[parsed.length - 1].close;
-      setPrice(latest);
-      setLastUpdate(new Date().toLocaleTimeString());
-      setError(null);
-      setLoading(false);
-      const closes = parsed.map(c => c.close);
-      const volumes = parsed.map(c => c.volume);
-      const sig = generateSignal(closes, volumes);
-      setSignal(sig);
-      return { closes, volumes, latest, sig };
-    } catch (e) {
-      setError("Could not fetch Bitcoin price. Check your internet connection.");
-      setLoading(false);
-      return null;
-    }
-  }, []);
+const [paperBalance, setPaperBalance] = useState(100.00);
+const [paperBets, setPaperBets] = useState([]);
+const [logs, setLogs] = useState([]);
+const [running, setRunning] = useState(false);
+const [betAmount, setBetAmount] = useState(5);
+const [marketFilter, setMarketFilter] = useState(“all”);
+const intervalRef = useRef(null);
+const keyIdRef = useRef(keyId);
+const privateKeyRef = useRef(privateKey);
+const betAmountRef = useRef(betAmount);
+const paperBalanceRef = useRef(paperBalance);
 
-  const executeTrade = useCallback((sig, currentPrice) => {
-    const { balance: bal, btcHeld: held, entryPrice: entry } = tradeRef.current;
-    const fee = 0.001; // 0.1% fee
+useEffect(() => { keyIdRef.current = keyId; }, [keyId]);
+useEffect(() => { privateKeyRef.current = privateKey; }, [privateKey]);
+useEffect(() => { betAmountRef.current = betAmount; }, [betAmount]);
+useEffect(() => { paperBalanceRef.current = paperBalance; }, [paperBalance]);
 
-    // Stop loss / take profit check
-    if (held > 0 && entry) {
-      const pnlPct = (currentPrice - entry) / entry;
-      if (pnlPct <= -0.008) {
-        // Stop loss at -0.8%
-        const proceeds = held * currentPrice * (1 - fee);
-        const pnl = proceeds - (held * entry);
-        tradeRef.current.balance = bal + proceeds;
-        tradeRef.current.btcHeld = 0;
-        tradeRef.current.entryPrice = null;
-        setBalance(tradeRef.current.balance);
-        setBtcHeld(0);
-        setEntryPrice(null);
-        setTotalPnl(prev => prev + pnl);
-        const trade = { type: "SELL", price: currentPrice, amount: held, pnl, time: new Date().toLocaleTimeString(), reason: "🛑 Stop Loss" };
-        setTrades(prev => [trade, ...prev].slice(0, 20));
-        addLog(`🛑 STOP LOSS at $${currentPrice.toLocaleString()} | P&L: $${pnl.toFixed(2)}`, "sell");
-        return;
-      }
-      if (pnlPct >= 0.015) {
-        // Take profit at +1.5%
-        const proceeds = held * currentPrice * (1 - fee);
-        const pnl = proceeds - (held * entry);
-        tradeRef.current.balance = bal + proceeds;
-        tradeRef.current.btcHeld = 0;
-        tradeRef.current.entryPrice = null;
-        setBalance(tradeRef.current.balance);
-        setBtcHeld(0);
-        setEntryPrice(null);
-        setTotalPnl(prev => prev + pnl);
-        const trade = { type: "SELL", price: currentPrice, amount: held, pnl, time: new Date().toLocaleTimeString(), reason: "🎯 Take Profit" };
-        setTrades(prev => [trade, ...prev].slice(0, 20));
-        addLog(`🎯 TAKE PROFIT at $${currentPrice.toLocaleString()} | P&L: +$${pnl.toFixed(2)}`, "buy");
-        return;
-      }
-    }
+const addLog = useCallback((msg, type = “info”) => {
+const time = new Date().toLocaleTimeString();
+setLogs(prev => [{ msg, type, time }, …prev].slice(0, 60));
+}, []);
 
-    if (sig.signal === "BUY" && held === 0 && bal > 10) {
-      const risk = bal * 0.95; // use 95% of balance
-      const btcAmount = (risk * (1 - fee)) / currentPrice;
-      tradeRef.current.balance = bal - risk;
-      tradeRef.current.btcHeld = btcAmount;
-      tradeRef.current.entryPrice = currentPrice;
-      setBalance(tradeRef.current.balance);
-      setBtcHeld(btcAmount);
-      setEntryPrice(currentPrice);
-      const trade = { type: "BUY", price: currentPrice, amount: btcAmount, pnl: null, time: new Date().toLocaleTimeString(), reason: `${sig.confidence}% confidence` };
-      setTrades(prev => [trade, ...prev].slice(0, 20));
-      addLog(`🟢 BUY ${btcAmount.toFixed(6)} BTC @ $${currentPrice.toLocaleString()} | Confidence: ${sig.confidence}%`, "buy");
-    } else if (sig.signal === "SELL" && held > 0) {
-      const proceeds = held * currentPrice * (1 - fee);
-      const pnl = proceeds - (held * entry);
-      tradeRef.current.balance = bal + proceeds;
-      tradeRef.current.btcHeld = 0;
-      tradeRef.current.entryPrice = null;
-      setBalance(tradeRef.current.balance);
-      setBtcHeld(0);
-      setEntryPrice(null);
-      setTotalPnl(prev => prev + pnl);
-      const trade = { type: "SELL", price: currentPrice, amount: held, pnl, time: new Date().toLocaleTimeString(), reason: `Signal sell` };
-      setTrades(prev => [trade, ...prev].slice(0, 20));
-      addLog(`🔴 SELL @ $${currentPrice.toLocaleString()} | P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`, pnl >= 0 ? "buy" : "sell");
-    }
-  }, [addLog]);
+const connect = async () => {
+if (!keyId.trim() || !privateKey.trim()) {
+setConnectError(“Both API Key ID and Private Key are required.”);
+return;
+}
+setConnecting(true);
+setConnectError(null);
+try {
+const data = await kalshiFetch(”/portfolio/balance”, “GET”, keyId.trim(), privateKey.trim(), null, useDemo);
+setBalance((data.balance / 100).toFixed(2));
+addLog(`✅ Connected to Kalshi ${useDemo ? "DEMO" : "LIVE"}. Balance: $${(data.balance / 100).toFixed(2)}`, “buy”);
+setScreen(“dashboard”);
+loadMarkets();
+} catch (e) {
+setConnectError(`Connection failed: ${e.message}`);
+} finally {
+setConnecting(false);
+}
+};
 
-  useEffect(() => { fetchCandles(); }, [fetchCandles]);
+const loadMarkets = async () => {
+setLoadingMarkets(true);
+try {
+const data = await kalshiPublicFetch(”/markets?limit=20&status=open”);
+setMarkets(data.markets || []);
+addLog(`📊 Loaded ${(data.markets || []).length} open markets`, “info”);
+} catch (e) {
+addLog(`⚠️ Could not load markets: ${e.message}`, “sell”);
+} finally {
+setLoadingMarkets(false);
+}
+};
 
-  useEffect(() => {
-    if (running) {
-      addLog("🤖 Bot started — scanning 15-min BTC candles...", "info");
-      intervalRef.current = setInterval(async () => {
-        const result = await fetchCandles();
-        if (result) executeTrade(result.sig, result.latest);
-      }, 30000); // refresh every 30s
-    } else {
-      clearInterval(intervalRef.current);
-      if (trades.length > 0) addLog("⏸ Bot paused.", "info");
-    }
-    return () => clearInterval(intervalRef.current);
-  }, [running, fetchCandles, executeTrade, addLog]);
+const analyzeMarket = async (market) => {
+setAnalyzingId(market.ticker);
+try {
+const analysis = await analyzeMarketWithClaude(market);
+setAnalyses(prev => ({ …prev, [market.ticker]: analysis }));
+addLog(`🤖 ${market.title.slice(0, 35)}... → ${analysis.side} (${analysis.confidence}% conf)`, analysis.side === “YES” ? “buy” : “sell”);
+} catch (e) {
+addLog(`⚠️ Analysis failed: ${e.message}`, “sell”);
+} finally {
+setAnalyzingId(null);
+}
+};
 
-  const portfolioValue = balance + (btcHeld * (price || 0));
-  const totalReturn = ((portfolioValue - 500) / 500 * 100).toFixed(2);
-  const unrealizedPnl = entryPrice && price ? (btcHeld * (price - entryPrice)).toFixed(2) : null;
+const placePaperBet = useCallback((market, analysis) => {
+const amount = betAmountRef.current;
+if (paperBalanceRef.current < amount) { addLog(“❌ Insufficient paper balance”, “sell”); return; }
+const price = analysis.side === “YES” ? (market.yes_ask / 100) : (market.no_ask / 100);
+setPaperBalance(prev => parseFloat((prev - amount).toFixed(2)));
+setPaperBets(prev => [{
+ticker: market.ticker, title: market.title, side: analysis.side,
+price, spent: amount, confidence: analysis.confidence,
+reasoning: analysis.reasoning, time: new Date().toLocaleTimeString(),
+}, …prev]);
+addLog(`📝 PAPER: ${analysis.side} "${market.title.slice(0, 30)}..." @ ${market[analysis.side === "YES" ? "yes_ask" : "no_ask"]}¢ | $${amount}`, analysis.side === “YES” ? “buy” : “sell”);
+}, [addLog]);
 
-  const sigColor = signal.signal === "BUY" ? "#00ff87" : signal.signal === "SELL" ? "#ff4466" : "#888";
+const placeRealBet = async (market, analysis) => {
+try {
+const price = analysis.side === “YES” ? market.yes_ask : market.no_ask;
+const count = Math.floor((betAmount * 100) / price);
+if (count < 1) { addLog(“❌ Bet amount too small”, “sell”); return; }
+await kalshiFetch(”/portfolio/orders”, “POST”, keyIdRef.current, privateKeyRef.current, {
+ticker: market.ticker,
+side: analysis.side.toLowerCase(),
+type: “limit”,
+yes_price: analysis.side === “YES” ? price : 100 - price,
+no_price: analysis.side === “NO” ? price : 100 - price,
+count,
+action: “buy”,
+}, useDemo);
+addLog(`✅ REAL ORDER: ${analysis.side} "${market.title.slice(0, 30)}..." | ${count} contracts`, “buy”);
+} catch (e) {
+addLog(`❌ Order failed: ${e.message}`, “sell”);
+}
+};
 
-  return (
-    <div style={{ minHeight: "100vh", background: "#04060a", color: "#e0e0e0", fontFamily: "'Courier New', monospace", padding: "16px", maxWidth: "480px", margin: "0 auto" }}>
-      {/* Header */}
-      <div style={{ textAlign: "center", marginBottom: "24px" }}>
-        <div style={{ fontSize: "11px", letterSpacing: "6px", color: "#555", marginBottom: "4px" }}>AUTONOMOUS</div>
-        <h1 style={{ fontSize: "32px", fontWeight: "900", letterSpacing: "4px", margin: 0, background: "linear-gradient(135deg, #f7931a, #ffcd3c)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
-          BTC BOT
-        </h1>
-        <div style={{ fontSize: "10px", letterSpacing: "4px", color: "#555", marginTop: "4px" }}>15-MINUTE SCALPER • PAPER TRADING</div>
-      </div>
+const autoRun = useCallback(async () => {
+addLog(“🤖 Auto-scanning markets…”, “info”);
+try {
+const data = await kalshiPublicFetch(”/markets?limit=10&status=open”);
+const mrkts = (data.markets || []).slice(0, 3);
+for (const m of mrkts) {
+try {
+const analysis = await analyzeMarketWithClaude(m);
+setAnalyses(prev => ({ …prev, [m.ticker]: analysis }));
+if (analysis.confidence >= 75) placePaperBet(m, analysis);
+} catch {}
+await new Promise(r => setTimeout(r, 1500));
+}
+} catch (e) {
+addLog(`⚠️ Auto-scan error: ${e.message}`, “sell”);
+}
+}, [addLog, placePaperBet]);
 
-      {/* Price */}
-      <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px", marginBottom: "12px", textAlign: "center" }}>
-        {loading ? (
-          <div style={{ color: "#555", fontSize: "14px" }}>Loading Bitcoin price...</div>
-        ) : error ? (
-          <div style={{ color: "#ff4466", fontSize: "13px" }}>{error}</div>
-        ) : (
-          <>
-            <div style={{ fontSize: "36px", fontWeight: "900", color: "#f7931a", letterSpacing: "2px" }}>
-              ${price?.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </div>
-            <div style={{ fontSize: "11px", color: "#444", marginTop: "4px" }}>BTC/USD • Updated {lastUpdate}</div>
-          </>
-        )}
-      </div>
+useEffect(() => {
+if (running) {
+addLog(“▶ Bot started — AI scanning every 2 min…”, “info”);
+autoRun();
+intervalRef.current = setInterval(autoRun, 120000);
+} else {
+clearInterval(intervalRef.current);
+}
+return () => clearInterval(intervalRef.current);
+}, [running, autoRun]);
 
-      {/* Signal */}
-      <div style={{ background: "#0d1117", border: `1px solid ${sigColor}33`, borderRadius: "12px", padding: "16px", marginBottom: "12px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-          <span style={{ fontSize: "11px", letterSpacing: "3px", color: "#555" }}>AI SIGNAL</span>
-          <span style={{ fontSize: "22px", fontWeight: "900", color: sigColor, letterSpacing: "3px" }}>
-            {signal.signal}
-            {signal.signal !== "WAIT" && <span style={{ fontSize: "13px", marginLeft: "8px", color: "#888" }}>{signal.confidence}% conf.</span>}
+const filteredMarkets = markets.filter(m => {
+if (marketFilter === “all”) return true;
+const t = (m.title || “”).toLowerCase();
+if (marketFilter === “politics”) return t.includes(“elect”) || t.includes(“president”) || t.includes(“congress”) || t.includes(“senate”);
+if (marketFilter === “economy”) return t.includes(“fed”) || t.includes(“inflation”) || t.includes(“gdp”) || t.includes(“rate”) || t.includes(“jobs”);
+if (marketFilter === “crypto”) return t.includes(“bitcoin”) || t.includes(“btc”) || t.includes(“eth”) || t.includes(“crypto”);
+return true;
+});
+
+// ── Connect Screen ──
+if (screen === “connect”) {
+return (
+<div style={{ minHeight: “100vh”, background: “#04060a”, color: “#e0e0e0”, fontFamily: “‘Courier New’, monospace”, display: “flex”, alignItems: “center”, justifyContent: “center”, padding: “24px” }}>
+<div style={{ width: “100%”, maxWidth: “420px” }}>
+<div style={{ textAlign: “center”, marginBottom: “32px” }}>
+<div style={{ fontSize: “10px”, letterSpacing: “6px”, color: “#444”, marginBottom: “6px” }}>AI-POWERED</div>
+<h1 style={{ fontSize: “28px”, fontWeight: “900”, letterSpacing: “4px”, margin: 0, background: “linear-gradient(135deg, #00e5b4, #00a8ff)”, WebkitBackgroundClip: “text”, WebkitTextFillColor: “transparent” }}>KALSHI BOT</h1>
+<div style={{ fontSize: “10px”, letterSpacing: “3px”, color: “#444”, marginTop: “6px” }}>PREDICTION MARKET TRADER</div>
+</div>
+
+```
+      <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "14px", padding: "24px", marginBottom: "12px" }}>
+        <div style={{ fontSize: "10px", letterSpacing: "3px", color: "#555", marginBottom: "20px" }}>CONNECT YOUR ACCOUNT</div>
+
+        <div style={{ marginBottom: "16px" }}>
+          <div style={{ fontSize: "10px", color: "#555", letterSpacing: "2px", marginBottom: "6px" }}>API KEY ID</div>
+          <input
+            value={keyId}
+            onChange={e => setKeyId(e.target.value)}
+            placeholder="e.g. a952bcbe-ec3b-4b5b-b8f9-..."
+            style={{ width: "100%", background: "#060a0f", border: "1px solid #1a2030", borderRadius: "8px", padding: "12px", color: "#e0e0e0", fontFamily: "'Courier New', monospace", fontSize: "12px", boxSizing: "border-box", outline: "none" }}
+          />
+        </div>
+
+        <div style={{ marginBottom: "16px" }}>
+          <div style={{ fontSize: "10px", color: "#555", letterSpacing: "2px", marginBottom: "6px" }}>RSA PRIVATE KEY (PEM FORMAT)</div>
+          <textarea
+            value={privateKey}
+            onChange={e => setPrivateKey(e.target.value)}
+            placeholder={"-----BEGIN PRIVATE KEY-----\nPaste your full private key here\n-----END PRIVATE KEY-----"}
+            rows={5}
+            style={{ width: "100%", background: "#060a0f", border: "1px solid #1a2030", borderRadius: "8px", padding: "12px", color: "#e0e0e0", fontFamily: "'Courier New', monospace", fontSize: "11px", boxSizing: "border-box", resize: "vertical", outline: "none" }}
+          />
+          <div style={{ fontSize: "10px", color: "#2a3040", marginTop: "4px" }}>Must include -----BEGIN/END PRIVATE KEY----- headers. Keys stay in your browser only.</div>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "20px" }}>
+          <div onClick={() => setUseDemo(!useDemo)} style={{ width: "36px", height: "20px", background: useDemo ? "#00e5b4" : "#1a2030", borderRadius: "10px", cursor: "pointer", position: "relative", transition: "background 0.2s", flexShrink: 0 }}>
+            <div style={{ position: "absolute", top: "3px", left: useDemo ? "18px" : "3px", width: "14px", height: "14px", background: "#fff", borderRadius: "50%", transition: "left 0.2s" }} />
+          </div>
+          <span style={{ fontSize: "11px", color: useDemo ? "#00e5b4" : "#ff4466" }}>
+            {useDemo ? "DEMO MODE (safe to test — recommended)" : "LIVE MODE (real money at risk)"}
           </span>
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-          {signal.reasons.slice(0, 4).map((r, i) => (
-            <div key={i} style={{ fontSize: "11px", color: r.type === "buy" ? "#00ff87aa" : r.type === "sell" ? "#ff4466aa" : "#666", paddingLeft: "8px", borderLeft: `2px solid ${r.type === "buy" ? "#00ff8744" : r.type === "sell" ? "#ff446644" : "#333"}` }}>
-              {r.text}
-            </div>
-          ))}
-          {signal.reasons.length === 0 && <div style={{ fontSize: "11px", color: "#444" }}>Waiting for clear setup...</div>}
-        </div>
-      </div>
 
-      {/* Portfolio */}
-      <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px", marginBottom: "12px" }}>
-        <div style={{ fontSize: "11px", letterSpacing: "3px", color: "#555", marginBottom: "12px" }}>PORTFOLIO</div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
-          <div>
-            <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>TOTAL VALUE</div>
-            <div style={{ fontSize: "22px", fontWeight: "700", color: portfolioValue >= 500 ? "#00ff87" : "#ff4466" }}>
-              ${portfolioValue.toFixed(2)}
-            </div>
+        {connectError && (
+          <div style={{ background: "#ff446615", border: "1px solid #ff446640", borderRadius: "8px", padding: "12px", marginBottom: "16px", fontSize: "12px", color: "#ff7799", lineHeight: "1.5" }}>
+            {connectError}
           </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>TOTAL RETURN</div>
-            <div style={{ fontSize: "22px", fontWeight: "700", color: parseFloat(totalReturn) >= 0 ? "#00ff87" : "#ff4466" }}>
-              {totalReturn >= 0 ? "+" : ""}{totalReturn}%
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>CASH</div>
-            <div style={{ fontSize: "16px", fontWeight: "600", color: "#e0e0e0" }}>${balance.toFixed(2)}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>BTC HELD</div>
-            <div style={{ fontSize: "16px", fontWeight: "600", color: "#f7931a" }}>{btcHeld.toFixed(6)}</div>
-          </div>
-          {unrealizedPnl && (
-            <div style={{ gridColumn: "1/-1" }}>
-              <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>UNREALIZED P&L</div>
-              <div style={{ fontSize: "16px", fontWeight: "600", color: parseFloat(unrealizedPnl) >= 0 ? "#00ff87" : "#ff4466" }}>
-                {parseFloat(unrealizedPnl) >= 0 ? "+" : ""}${unrealizedPnl}
-              </div>
-            </div>
-          )}
-        </div>
-        <div style={{ marginTop: "12px", display: "flex", justifyContent: "space-between", fontSize: "11px", color: "#444" }}>
-          <span>Realized P&L: <span style={{ color: totalPnl >= 0 ? "#00ff87" : "#ff4466" }}>{totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)}</span></span>
-          <span>Trades: {trades.length}</span>
-        </div>
-      </div>
-
-      {/* Start/Stop */}
-      <button
-        onClick={() => setRunning(r => !r)}
-        style={{
-          width: "100%", padding: "18px", border: "none", borderRadius: "12px", fontSize: "16px", fontWeight: "900", letterSpacing: "4px", cursor: "pointer", marginBottom: "12px",
-          background: running ? "#ff446620" : "#00ff87",
-          color: running ? "#ff4466" : "#04060a",
-          border: running ? "1px solid #ff4466" : "none",
-          transition: "all 0.2s"
-        }}
-      >
-        {running ? "⏸ STOP BOT" : "▶ START BOT"}
-      </button>
-
-      {/* Trade History */}
-      {trades.length > 0 && (
-        <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px", marginBottom: "12px" }}>
-          <div style={{ fontSize: "11px", letterSpacing: "3px", color: "#555", marginBottom: "12px" }}>TRADE HISTORY</div>
-          {trades.slice(0, 5).map((t, i) => (
-            <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #0f1620", fontSize: "12px" }}>
-              <div>
-                <span style={{ color: t.type === "BUY" ? "#00ff87" : "#ff4466", fontWeight: "700", marginRight: "8px" }}>{t.type}</span>
-                <span style={{ color: "#555" }}>{t.time}</span>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ color: "#e0e0e0" }}>${t.price.toLocaleString()}</div>
-                {t.pnl !== null && (
-                  <div style={{ color: t.pnl >= 0 ? "#00ff87" : "#ff4466", fontSize: "11px" }}>
-                    {t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Logs */}
-      <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px" }}>
-        <div style={{ fontSize: "11px", letterSpacing: "3px", color: "#555", marginBottom: "12px" }}>BOT LOG</div>
-        <div style={{ maxHeight: "160px", overflowY: "auto" }}>
-          {logs.length === 0 ? (
-            <div style={{ color: "#333", fontSize: "12px" }}>Press START BOT to begin trading...</div>
-          ) : logs.map((l, i) => (
-            <div key={i} style={{ fontSize: "11px", color: l.type === "buy" ? "#00ff87" : l.type === "sell" ? "#ff4466" : "#555", marginBottom: "4px" }}>
-              <span style={{ color: "#333", marginRight: "6px" }}>{l.time}</span>{l.msg}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div style={{ textAlign: "center", marginTop: "16px", fontSize: "10px", color: "#333", letterSpacing: "2px" }}>
-        PAPER TRADING ONLY • NO REAL MONEY AT RISK
-      </div>
-    </div>
-  );
-}
-
-
-// ── Public market data (no auth needed, CORS enabled) ──
-const KRAKEN_BASE = "https://api.kraken.com/0/public";
-
-// ── Technical Indicators ──
-function calcEMA(data, period) {
-  const k = 2 / (period + 1);
-  let ema = data.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  const result = new Array(period - 1).fill(null);
-  result.push(ema);
-  for (let i = period; i < data.length; i++) {
-    ema = data[i] * k + ema * (1 - k);
-    result.push(ema);
-  }
-  return result;
-}
-
-function calcRSI(data, period = 14) {
-  const result = new Array(period).fill(null);
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const diff = data[i] - data[i - 1];
-    if (diff > 0) gains += diff; else losses -= diff;
-  }
-  let avgGain = gains / period, avgLoss = losses / period;
-  result.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
-  for (let i = period + 1; i < data.length; i++) {
-    const diff = data[i] - data[i - 1];
-    avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
-    avgLoss = (avgLoss * (period - 1) + Math.max(-diff, 0)) / period;
-    result.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
-  }
-  return result;
-}
-
-function calcMACD(closes) {
-  const ema12 = calcEMA(closes, 12);
-  const ema26 = calcEMA(closes, 26);
-  const macd = ema12.map((v, i) => (v && ema26[i] ? v - ema26[i] : null));
-  const validMacd = macd.filter(Boolean);
-  const signal = calcEMA(validMacd, 9);
-  const fullSignal = new Array(macd.length - signal.length).fill(null).concat(signal);
-  return { macd, signal: fullSignal };
-}
-
-function calcBollingerBands(closes, period = 20, stdDev = 2) {
-  const result = { upper: [], middle: [], lower: [] };
-  for (let i = 0; i < closes.length; i++) {
-    if (i < period - 1) { result.upper.push(null); result.middle.push(null); result.lower.push(null); continue; }
-    const slice = closes.slice(i - period + 1, i + 1);
-    const mean = slice.reduce((a, b) => a + b, 0) / period;
-    const variance = slice.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / period;
-    const sd = Math.sqrt(variance);
-    result.upper.push(mean + stdDev * sd);
-    result.middle.push(mean);
-    result.lower.push(mean - stdDev * sd);
-  }
-  return result;
-}
-
-// ── Signal Engine ──
-function generateSignal(closes, volumes) {
-  if (closes.length < 30) return { signal: "WAIT", confidence: 0, reasons: [] };
-  const rsi = calcRSI(closes);
-  const ema9 = calcEMA(closes, 9);
-  const ema21 = calcEMA(closes, 21);
-  const { macd, signal: macdSignal } = calcMACD(closes);
-  const bb = calcBollingerBands(closes);
-  const n = closes.length - 1;
-  const curRSI = rsi[n], prevRSI = rsi[n - 1];
-  const curEMA9 = ema9[n], prevEMA9 = ema9[n - 1];
-  const curEMA21 = ema21[n], prevEMA21 = ema21[n - 1];
-  const curMACD = macd[n], curSignal = macdSignal[n];
-  const prevMACD = macd[n - 1], prevSignalLine = macdSignal[n - 1];
-  const price = closes[n];
-  const bbLower = bb.lower[n], bbUpper = bb.upper[n];
-  const avgVol = volumes.slice(-10).reduce((a, b) => a + b, 0) / 10;
-  const volSpike = volumes[n] > avgVol * 1.3;
-
-  let buyScore = 0, sellScore = 0;
-  const reasons = [];
-
-  // RSI signals
-  if (curRSI < 30) { buyScore += 3; reasons.push({ type: "buy", text: `RSI oversold (${curRSI.toFixed(1)})` }); }
-  else if (curRSI < 40 && prevRSI < curRSI) { buyScore += 2; reasons.push({ type: "buy", text: `RSI rising from low (${curRSI.toFixed(1)})` }); }
-  if (curRSI > 70) { sellScore += 3; reasons.push({ type: "sell", text: `RSI overbought (${curRSI.toFixed(1)})` }); }
-  else if (curRSI > 60 && prevRSI > curRSI) { sellScore += 2; reasons.push({ type: "sell", text: `RSI falling from high (${curRSI.toFixed(1)})` }); }
-
-  // EMA crossover
-  if (prevEMA9 < prevEMA21 && curEMA9 > curEMA21) { buyScore += 3; reasons.push({ type: "buy", text: "EMA9 crossed above EMA21 🚀" }); }
-  if (prevEMA9 > prevEMA21 && curEMA9 < curEMA21) { sellScore += 3; reasons.push({ type: "sell", text: "EMA9 crossed below EMA21 ⬇️" }); }
-  if (curEMA9 > curEMA21) { buyScore += 1; reasons.push({ type: "buy", text: "Uptrend (EMA9 > EMA21)" }); }
-  else { sellScore += 1; reasons.push({ type: "sell", text: "Downtrend (EMA9 < EMA21)" }); }
-
-  // MACD
-  if (curMACD && curSignal && prevMACD && prevSignalLine) {
-    if (prevMACD < prevSignalLine && curMACD > curSignal) { buyScore += 3; reasons.push({ type: "buy", text: "MACD bullish crossover ✨" }); }
-    if (prevMACD > prevSignalLine && curMACD < curSignal) { sellScore += 3; reasons.push({ type: "sell", text: "MACD bearish crossover ⚠️" }); }
-    if (curMACD > 0 && curMACD > curSignal) { buyScore += 1; reasons.push({ type: "buy", text: "MACD positive momentum" }); }
-  }
-
-  // Bollinger Bands
-  if (bbLower && price < bbLower) { buyScore += 2; reasons.push({ type: "buy", text: "Price below BB lower band" }); }
-  if (bbUpper && price > bbUpper) { sellScore += 2; reasons.push({ type: "sell", text: "Price above BB upper band" }); }
-
-  // Volume
-  if (volSpike && buyScore > sellScore) { buyScore += 1; reasons.push({ type: "buy", text: "High volume confirms move" }); }
-
-  const total = buyScore + sellScore;
-  if (total === 0) return { signal: "WAIT", confidence: 0, reasons };
-
-  if (buyScore > sellScore && buyScore >= 5) {
-    return { signal: "BUY", confidence: Math.min(Math.round((buyScore / (buyScore + sellScore)) * 100), 99), reasons };
-  }
-  if (sellScore > buyScore && sellScore >= 5) {
-    return { signal: "SELL", confidence: Math.min(Math.round((sellScore / (buyScore + sellScore)) * 100), 99), reasons };
-  }
-  return { signal: "WAIT", confidence: 0, reasons };
-}
-
-// ── Main App ──
-export default function CryptoBot() {
-  const [candles, setCandles] = useState([]);
-  const [price, setPrice] = useState(null);
-  const [signal, setSignal] = useState({ signal: "WAIT", confidence: 0, reasons: [] });
-  const [balance, setBalance] = useState(500);
-  const [btcHeld, setBtcHeld] = useState(0);
-  const [trades, setTrades] = useState([]);
-  const [logs, setLogs] = useState([]);
-  const [running, setRunning] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [entryPrice, setEntryPrice] = useState(null);
-  const [totalPnl, setTotalPnl] = useState(0);
-  const [lastUpdate, setLastUpdate] = useState(null);
-  const intervalRef = useRef(null);
-  const tradeRef = useRef({ balance: 500, btcHeld: 0, entryPrice: null });
-
-  const addLog = useCallback((msg, type = "info") => {
-    const time = new Date().toLocaleTimeString();
-    setLogs(prev => [{ msg, type, time }, ...prev].slice(0, 50));
-  }, []);
-
-  const fetchCandles = useCallback(async () => {
-    try {
-      const res = await fetch(`${KRAKEN_BASE}/OHLC?pair=XBTUSD&interval=15`);
-      const data = await res.json();
-      if (data.error && data.error.length > 0) throw new Error(data.error[0]);
-      const raw = data.result.XXBTZUSD || data.result[Object.keys(data.result)[0]];
-      const parsed = raw.slice(-60).map(c => ({
-        time: c[0], open: parseFloat(c[1]), high: parseFloat(c[2]),
-        low: parseFloat(c[3]), close: parseFloat(c[4]), volume: parseFloat(c[6])
-      }));
-      setCandles(parsed);
-      const latest = parsed[parsed.length - 1].close;
-      setPrice(latest);
-      setLastUpdate(new Date().toLocaleTimeString());
-      setError(null);
-      setLoading(false);
-      const closes = parsed.map(c => c.close);
-      const volumes = parsed.map(c => c.volume);
-      const sig = generateSignal(closes, volumes);
-      setSignal(sig);
-      return { closes, volumes, latest, sig };
-    } catch (e) {
-      setError("Could not fetch Bitcoin price. Check your internet connection.");
-      setLoading(false);
-      return null;
-    }
-  }, []);
-
-  const executeTrade = useCallback((sig, currentPrice) => {
-    const { balance: bal, btcHeld: held, entryPrice: entry } = tradeRef.current;
-    const fee = 0.001; // 0.1% fee
-
-    // Stop loss / take profit check
-    if (held > 0 && entry) {
-      const pnlPct = (currentPrice - entry) / entry;
-      if (pnlPct <= -0.008) {
-        // Stop loss at -0.8%
-        const proceeds = held * currentPrice * (1 - fee);
-        const pnl = proceeds - (held * entry);
-        tradeRef.current.balance = bal + proceeds;
-        tradeRef.current.btcHeld = 0;
-        tradeRef.current.entryPrice = null;
-        setBalance(tradeRef.current.balance);
-        setBtcHeld(0);
-        setEntryPrice(null);
-        setTotalPnl(prev => prev + pnl);
-        const trade = { type: "SELL", price: currentPrice, amount: held, pnl, time: new Date().toLocaleTimeString(), reason: "🛑 Stop Loss" };
-        setTrades(prev => [trade, ...prev].slice(0, 20));
-        addLog(`🛑 STOP LOSS at $${currentPrice.toLocaleString()} | P&L: $${pnl.toFixed(2)}`, "sell");
-        return;
-      }
-      if (pnlPct >= 0.015) {
-        // Take profit at +1.5%
-        const proceeds = held * currentPrice * (1 - fee);
-        const pnl = proceeds - (held * entry);
-        tradeRef.current.balance = bal + proceeds;
-        tradeRef.current.btcHeld = 0;
-        tradeRef.current.entryPrice = null;
-        setBalance(tradeRef.current.balance);
-        setBtcHeld(0);
-        setEntryPrice(null);
-        setTotalPnl(prev => prev + pnl);
-        const trade = { type: "SELL", price: currentPrice, amount: held, pnl, time: new Date().toLocaleTimeString(), reason: "🎯 Take Profit" };
-        setTrades(prev => [trade, ...prev].slice(0, 20));
-        addLog(`🎯 TAKE PROFIT at $${currentPrice.toLocaleString()} | P&L: +$${pnl.toFixed(2)}`, "buy");
-        return;
-      }
-    }
-
-    if (sig.signal === "BUY" && held === 0 && bal > 10) {
-      const risk = bal * 0.95; // use 95% of balance
-      const btcAmount = (risk * (1 - fee)) / currentPrice;
-      tradeRef.current.balance = bal - risk;
-      tradeRef.current.btcHeld = btcAmount;
-      tradeRef.current.entryPrice = currentPrice;
-      setBalance(tradeRef.current.balance);
-      setBtcHeld(btcAmount);
-      setEntryPrice(currentPrice);
-      const trade = { type: "BUY", price: currentPrice, amount: btcAmount, pnl: null, time: new Date().toLocaleTimeString(), reason: `${sig.confidence}% confidence` };
-      setTrades(prev => [trade, ...prev].slice(0, 20));
-      addLog(`🟢 BUY ${btcAmount.toFixed(6)} BTC @ $${currentPrice.toLocaleString()} | Confidence: ${sig.confidence}%`, "buy");
-    } else if (sig.signal === "SELL" && held > 0) {
-      const proceeds = held * currentPrice * (1 - fee);
-      const pnl = proceeds - (held * entry);
-      tradeRef.current.balance = bal + proceeds;
-      tradeRef.current.btcHeld = 0;
-      tradeRef.current.entryPrice = null;
-      setBalance(tradeRef.current.balance);
-      setBtcHeld(0);
-      setEntryPrice(null);
-      setTotalPnl(prev => prev + pnl);
-      const trade = { type: "SELL", price: currentPrice, amount: held, pnl, time: new Date().toLocaleTimeString(), reason: `Signal sell` };
-      setTrades(prev => [trade, ...prev].slice(0, 20));
-      addLog(`🔴 SELL @ $${currentPrice.toLocaleString()} | P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`, pnl >= 0 ? "buy" : "sell");
-    }
-  }, [addLog]);
-
-  useEffect(() => { fetchCandles(); }, [fetchCandles]);
-
-  useEffect(() => {
-    if (running) {
-      addLog("🤖 Bot started — scanning 15-min BTC candles...", "info");
-      intervalRef.current = setInterval(async () => {
-        const result = await fetchCandles();
-        if (result) executeTrade(result.sig, result.latest);
-      }, 30000); // refresh every 30s
-    } else {
-      clearInterval(intervalRef.current);
-      if (trades.length > 0) addLog("⏸ Bot paused.", "info");
-    }
-    return () => clearInterval(intervalRef.current);
-  }, [running, fetchCandles, executeTrade, addLog]);
-
-  const portfolioValue = balance + (btcHeld * (price || 0));
-  const totalReturn = ((portfolioValue - 500) / 500 * 100).toFixed(2);
-  const unrealizedPnl = entryPrice && price ? (btcHeld * (price - entryPrice)).toFixed(2) : null;
-
-  const sigColor = signal.signal === "BUY" ? "#00ff87" : signal.signal === "SELL" ? "#ff4466" : "#888";
-
-  return (
-    <div style={{ minHeight: "100vh", background: "#04060a", color: "#e0e0e0", fontFamily: "'Courier New', monospace", padding: "16px", maxWidth: "480px", margin: "0 auto" }}>
-      {/* Header */}
-      <div style={{ textAlign: "center", marginBottom: "24px" }}>
-        <div style={{ fontSize: "11px", letterSpacing: "6px", color: "#555", marginBottom: "4px" }}>AUTONOMOUS</div>
-        <h1 style={{ fontSize: "32px", fontWeight: "900", letterSpacing: "4px", margin: 0, background: "linear-gradient(135deg, #f7931a, #ffcd3c)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
-          BTC BOT
-        </h1>
-        <div style={{ fontSize: "10px", letterSpacing: "4px", color: "#555", marginTop: "4px" }}>15-MINUTE SCALPER • PAPER TRADING</div>
-      </div>
-
-      {/* Price */}
-      <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px", marginBottom: "12px", textAlign: "center" }}>
-        {loading ? (
-          <div style={{ color: "#555", fontSize: "14px" }}>Loading Bitcoin price...</div>
-        ) : error ? (
-          <div style={{ color: "#ff4466", fontSize: "13px" }}>{error}</div>
-        ) : (
-          <>
-            <div style={{ fontSize: "36px", fontWeight: "900", color: "#f7931a", letterSpacing: "2px" }}>
-              ${price?.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </div>
-            <div style={{ fontSize: "11px", color: "#444", marginTop: "4px" }}>BTC/USD • Updated {lastUpdate}</div>
-          </>
         )}
+
+        <button onClick={connect} disabled={connecting} style={{ width: "100%", padding: "16px", border: "none", borderRadius: "10px", fontSize: "14px", fontWeight: "900", letterSpacing: "3px", cursor: connecting ? "not-allowed" : "pointer", background: connecting ? "#1a2030" : "linear-gradient(135deg, #00e5b4, #00a8ff)", color: connecting ? "#555" : "#04060a" }}>
+          {connecting ? "CONNECTING..." : "CONNECT →"}
+        </button>
       </div>
 
-      {/* Signal */}
-      <div style={{ background: "#0d1117", border: `1px solid ${sigColor}33`, borderRadius: "12px", padding: "16px", marginBottom: "12px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-          <span style={{ fontSize: "11px", letterSpacing: "3px", color: "#555" }}>AI SIGNAL</span>
-          <span style={{ fontSize: "22px", fontWeight: "900", color: sigColor, letterSpacing: "3px" }}>
-            {signal.signal}
-            {signal.signal !== "WAIT" && <span style={{ fontSize: "13px", marginLeft: "8px", color: "#888" }}>{signal.confidence}% conf.</span>}
-          </span>
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-          {signal.reasons.slice(0, 4).map((r, i) => (
-            <div key={i} style={{ fontSize: "11px", color: r.type === "buy" ? "#00ff87aa" : r.type === "sell" ? "#ff4466aa" : "#666", paddingLeft: "8px", borderLeft: `2px solid ${r.type === "buy" ? "#00ff8744" : r.type === "sell" ? "#ff446644" : "#333"}` }}>
-              {r.text}
-            </div>
-          ))}
-          {signal.reasons.length === 0 && <div style={{ fontSize: "11px", color: "#444" }}>Waiting for clear setup...</div>}
-        </div>
-      </div>
-
-      {/* Portfolio */}
-      <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px", marginBottom: "12px" }}>
-        <div style={{ fontSize: "11px", letterSpacing: "3px", color: "#555", marginBottom: "12px" }}>PORTFOLIO</div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
-          <div>
-            <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>TOTAL VALUE</div>
-            <div style={{ fontSize: "22px", fontWeight: "700", color: portfolioValue >= 500 ? "#00ff87" : "#ff4466" }}>
-              ${portfolioValue.toFixed(2)}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>TOTAL RETURN</div>
-            <div style={{ fontSize: "22px", fontWeight: "700", color: parseFloat(totalReturn) >= 0 ? "#00ff87" : "#ff4466" }}>
-              {totalReturn >= 0 ? "+" : ""}{totalReturn}%
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>CASH</div>
-            <div style={{ fontSize: "16px", fontWeight: "600", color: "#e0e0e0" }}>${balance.toFixed(2)}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>BTC HELD</div>
-            <div style={{ fontSize: "16px", fontWeight: "600", color: "#f7931a" }}>{btcHeld.toFixed(6)}</div>
-          </div>
-          {unrealizedPnl && (
-            <div style={{ gridColumn: "1/-1" }}>
-              <div style={{ fontSize: "10px", color: "#444", marginBottom: "4px" }}>UNREALIZED P&L</div>
-              <div style={{ fontSize: "16px", fontWeight: "600", color: parseFloat(unrealizedPnl) >= 0 ? "#00ff87" : "#ff4466" }}>
-                {parseFloat(unrealizedPnl) >= 0 ? "+" : ""}${unrealizedPnl}
-              </div>
-            </div>
-          )}
-        </div>
-        <div style={{ marginTop: "12px", display: "flex", justifyContent: "space-between", fontSize: "11px", color: "#444" }}>
-          <span>Realized P&L: <span style={{ color: totalPnl >= 0 ? "#00ff87" : "#ff4466" }}>{totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)}</span></span>
-          <span>Trades: {trades.length}</span>
-        </div>
-      </div>
-
-      {/* Start/Stop */}
-      <button
-        onClick={() => setRunning(r => !r)}
-        style={{
-          width: "100%", padding: "18px", border: "none", borderRadius: "12px", fontSize: "16px", fontWeight: "900", letterSpacing: "4px", cursor: "pointer", marginBottom: "12px",
-          background: running ? "#ff446620" : "#00ff87",
-          color: running ? "#ff4466" : "#04060a",
-          border: running ? "1px solid #ff4466" : "none",
-          transition: "all 0.2s"
-        }}
-      >
-        {running ? "⏸ STOP BOT" : "▶ START BOT"}
-      </button>
-
-      {/* Trade History */}
-      {trades.length > 0 && (
-        <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px", marginBottom: "12px" }}>
-          <div style={{ fontSize: "11px", letterSpacing: "3px", color: "#555", marginBottom: "12px" }}>TRADE HISTORY</div>
-          {trades.slice(0, 5).map((t, i) => (
-            <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #0f1620", fontSize: "12px" }}>
-              <div>
-                <span style={{ color: t.type === "BUY" ? "#00ff87" : "#ff4466", fontWeight: "700", marginRight: "8px" }}>{t.type}</span>
-                <span style={{ color: "#555" }}>{t.time}</span>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ color: "#e0e0e0" }}>${t.price.toLocaleString()}</div>
-                {t.pnl !== null && (
-                  <div style={{ color: t.pnl >= 0 ? "#00ff87" : "#ff4466", fontSize: "11px" }}>
-                    {t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Logs */}
-      <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px" }}>
-        <div style={{ fontSize: "11px", letterSpacing: "3px", color: "#555", marginBottom: "12px" }}>BOT LOG</div>
-        <div style={{ maxHeight: "160px", overflowY: "auto" }}>
-          {logs.length === 0 ? (
-            <div style={{ color: "#333", fontSize: "12px" }}>Press START BOT to begin trading...</div>
-          ) : logs.map((l, i) => (
-            <div key={i} style={{ fontSize: "11px", color: l.type === "buy" ? "#00ff87" : l.type === "sell" ? "#ff4466" : "#555", marginBottom: "4px" }}>
-              <span style={{ color: "#333", marginRight: "6px" }}>{l.time}</span>{l.msg}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div style={{ textAlign: "center", marginTop: "16px", fontSize: "10px", color: "#333", letterSpacing: "2px" }}>
-        PAPER TRADING ONLY • NO REAL MONEY AT RISK
+      <div style={{ background: "#080b10", border: "1px solid #0f1520", borderRadius: "10px", padding: "14px", fontSize: "11px", color: "#333", lineHeight: "1.8" }}>
+        <div style={{ color: "#444", marginBottom: "4px", letterSpacing: "2px", fontSize: "9px" }}>HOW TO GET YOUR KEYS</div>
+        1. kalshi.com → Settings → API<br />
+        2. Create new key pair<br />
+        3. Copy the Key ID (UUID)<br />
+        4. Paste the full .pem private key file contents
       </div>
     </div>
-  );
+  </div>
+);
+```
+
+}
+
+// ── Dashboard ──
+return (
+<div style={{ minHeight: “100vh”, background: “#04060a”, color: “#e0e0e0”, fontFamily: “‘Courier New’, monospace”, padding: “16px”, maxWidth: “500px”, margin: “0 auto” }}>
+<div style={{ display: “flex”, justifyContent: “space-between”, alignItems: “center”, marginBottom: “20px” }}>
+<div>
+<h1 style={{ fontSize: “20px”, fontWeight: “900”, letterSpacing: “3px”, margin: 0, background: “linear-gradient(135deg, #00e5b4, #00a8ff)”, WebkitBackgroundClip: “text”, WebkitTextFillColor: “transparent” }}>KALSHI BOT</h1>
+<div style={{ fontSize: “9px”, letterSpacing: “2px”, color: useDemo ? “#00e5b4” : “#ff4466”, marginTop: “2px” }}>{useDemo ? “● DEMO” : “● LIVE”}</div>
+</div>
+<div style={{ textAlign: “right” }}>
+<div style={{ fontSize: “9px”, color: “#444”, letterSpacing: “1px” }}>KALSHI BALANCE</div>
+<div style={{ fontSize: “20px”, fontWeight: “700”, color: “#00e5b4” }}>${balance}</div>
+</div>
+</div>
+
+```
+  {/* Paper Stats */}
+  <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px", marginBottom: "12px" }}>
+    <div style={{ fontSize: "10px", letterSpacing: "3px", color: "#555", marginBottom: "12px" }}>PAPER TRADING</div>
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px" }}>
+      <div>
+        <div style={{ fontSize: "9px", color: "#444", marginBottom: "3px" }}>BALANCE</div>
+        <div style={{ fontSize: "18px", fontWeight: "700", color: "#e0e0e0" }}>${paperBalance.toFixed(2)}</div>
+      </div>
+      <div>
+        <div style={{ fontSize: "9px", color: "#444", marginBottom: "3px" }}>BETS PLACED</div>
+        <div style={{ fontSize: "18px", fontWeight: "700", color: "#00a8ff" }}>{paperBets.length}</div>
+      </div>
+      <div>
+        <div style={{ fontSize: "9px", color: "#444", marginBottom: "3px" }}>DEPLOYED</div>
+        <div style={{ fontSize: "18px", fontWeight: "700", color: "#888" }}>${(100 - paperBalance).toFixed(2)}</div>
+      </div>
+    </div>
+    <div style={{ marginTop: "12px", display: "flex", alignItems: "center", gap: "8px" }}>
+      <span style={{ fontSize: "10px", color: "#444" }}>BET $</span>
+      <input type="number" value={betAmount} onChange={e => setBetAmount(Math.max(1, parseFloat(e.target.value) || 1))} style={{ width: "60px", background: "#060a0f", border: "1px solid #1a2030", borderRadius: "6px", padding: "6px 8px", color: "#e0e0e0", fontFamily: "'Courier New', monospace", fontSize: "13px", outline: "none" }} />
+      <span style={{ fontSize: "10px", color: "#333" }}>per trade</span>
+    </div>
+  </div>
+
+  {/* Bot Control */}
+  <button onClick={() => setRunning(r => !r)} style={{ width: "100%", padding: "16px", border: "none", borderRadius: "12px", fontSize: "14px", fontWeight: "900", letterSpacing: "4px", cursor: "pointer", marginBottom: "12px", background: running ? "#ff446620" : "linear-gradient(135deg, #00e5b4, #00a8ff)", color: running ? "#ff4466" : "#04060a", border: running ? "1px solid #ff4466" : "none" }}>
+    {running ? "⏸ STOP AUTO-BOT" : "▶ START AUTO-BOT"}
+  </button>
+
+  {/* Markets */}
+  <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px", marginBottom: "12px" }}>
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+      <div style={{ fontSize: "10px", letterSpacing: "3px", color: "#555" }}>LIVE MARKETS</div>
+      <button onClick={loadMarkets} style={{ background: "none", border: "1px solid #1a2030", borderRadius: "6px", color: "#555", fontSize: "9px", padding: "4px 10px", cursor: "pointer" }}>
+        {loadingMarkets ? "LOADING..." : "↻ REFRESH"}
+      </button>
+    </div>
+
+    <div style={{ display: "flex", gap: "6px", marginBottom: "12px", flexWrap: "wrap" }}>
+      {["all", "politics", "economy", "crypto"].map(f => (
+        <button key={f} onClick={() => setMarketFilter(f)} style={{ background: marketFilter === f ? "#00e5b420" : "none", border: `1px solid ${marketFilter === f ? "#00e5b4" : "#1a2030"}`, borderRadius: "6px", color: marketFilter === f ? "#00e5b4" : "#444", fontSize: "9px", padding: "4px 10px", cursor: "pointer", letterSpacing: "1px", textTransform: "uppercase" }}>
+          {f}
+        </button>
+      ))}
+    </div>
+
+    {loadingMarkets ? (
+      <div style={{ color: "#333", fontSize: "12px", textAlign: "center", padding: "20px" }}>Loading markets...</div>
+    ) : filteredMarkets.length === 0 ? (
+      <div style={{ color: "#333", fontSize: "12px", textAlign: "center", padding: "20px" }}>No markets. Press REFRESH.</div>
+    ) : (
+      <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "420px", overflowY: "auto" }}>
+        {filteredMarkets.slice(0, 10).map(m => {
+          const analysis = analyses[m.ticker];
+          const isAnalyzing = analyzingId === m.ticker;
+          return (
+            <div key={m.ticker} style={{ background: "#060a0f", border: `1px solid ${analysis ? (analysis.side === "YES" ? "#00e5b430" : "#ff446630") : "#0f1520"}`, borderRadius: "10px", padding: "12px" }}>
+              <div style={{ fontSize: "11px", color: "#bbb", marginBottom: "8px", lineHeight: "1.5" }}>{m.title}</div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ display: "flex", gap: "12px" }}>
+                  <span style={{ fontSize: "11px", color: "#00e5b4" }}>YES {m.yes_ask}¢</span>
+                  <span style={{ fontSize: "11px", color: "#ff4466" }}>NO {m.no_ask}¢</span>
+                </div>
+                <button onClick={() => analyzeMarket(m)} disabled={isAnalyzing} style={{ background: "none", border: "1px solid #1a2030", borderRadius: "6px", color: isAnalyzing ? "#333" : "#00a8ff", fontSize: "9px", padding: "4px 10px", cursor: isAnalyzing ? "not-allowed" : "pointer", letterSpacing: "1px", fontFamily: "'Courier New', monospace" }}>
+                  {isAnalyzing ? "THINKING..." : "AI ANALYZE"}
+                </button>
+              </div>
+
+              {analysis && (
+                <div style={{ marginTop: "10px", paddingTop: "10px", borderTop: "1px solid #0f1520" }}>
+                  <div style={{ fontSize: "13px", fontWeight: "700", color: analysis.side === "YES" ? "#00e5b4" : "#ff4466", marginBottom: "5px" }}>
+                    {analysis.side} — {analysis.confidence}% confidence
+                  </div>
+                  <div style={{ fontSize: "10px", color: "#445", lineHeight: "1.5", marginBottom: "8px" }}>{analysis.reasoning}</div>
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    <button onClick={() => placePaperBet(m, analysis)} style={{ flex: 1, background: "#00e5b410", border: "1px solid #00e5b430", borderRadius: "6px", color: "#00e5b4", fontSize: "9px", padding: "8px", cursor: "pointer", letterSpacing: "1px", fontFamily: "'Courier New', monospace" }}>
+                      PAPER ${betAmount}
+                    </button>
+                    {!useDemo && (
+                      <button onClick={() => placeRealBet(m, analysis)} style={{ flex: 1, background: "#ff446610", border: "1px solid #ff446630", borderRadius: "6px", color: "#ff4466", fontSize: "9px", padding: "8px", cursor: "pointer", letterSpacing: "1px", fontFamily: "'Courier New', monospace" }}>
+                        REAL ${betAmount}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    )}
+  </div>
+
+  {/* Paper Bets */}
+  {paperBets.length > 0 && (
+    <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px", marginBottom: "12px" }}>
+      <div style={{ fontSize: "10px", letterSpacing: "3px", color: "#555", marginBottom: "10px" }}>PAPER BETS ({paperBets.length})</div>
+      {paperBets.slice(0, 5).map((b, i) => (
+        <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid #080c10", fontSize: "11px" }}>
+          <div>
+            <span style={{ color: b.side === "YES" ? "#00e5b4" : "#ff4466", fontWeight: "700", marginRight: "6px" }}>{b.side}</span>
+            <span style={{ color: "#333" }}>{b.title.slice(0, 30)}...</span>
+          </div>
+          <span style={{ color: "#666" }}>${b.spent} @ {(b.price * 100).toFixed(0)}¢</span>
+        </div>
+      ))}
+    </div>
+  )}
+
+  {/* Log */}
+  <div style={{ background: "#0d1117", border: "1px solid #1a2030", borderRadius: "12px", padding: "16px" }}>
+    <div style={{ fontSize: "10px", letterSpacing: "3px", color: "#555", marginBottom: "10px" }}>BOT LOG</div>
+    <div style={{ maxHeight: "150px", overflowY: "auto" }}>
+      {logs.length === 0 ? (
+        <div style={{ color: "#222", fontSize: "11px" }}>Waiting for activity...</div>
+      ) : logs.map((l, i) => (
+        <div key={i} style={{ fontSize: "10px", color: l.type === "buy" ? "#00e5b4" : l.type === "sell" ? "#ff4466" : "#333", marginBottom: "3px" }}>
+          <span style={{ color: "#1a2030", marginRight: "6px" }}>{l.time}</span>{l.msg}
+        </div>
+      ))}
+    </div>
+  </div>
+
+  <div style={{ textAlign: "center", marginTop: "14px", fontSize: "9px", color: "#1a2030", letterSpacing: "2px" }}>
+    {useDemo ? "DEMO MODE • NO REAL MONEY" : "⚠ LIVE MODE • REAL MONEY AT RISK"}
+  </div>
+</div>
+```
+
+);
 }
